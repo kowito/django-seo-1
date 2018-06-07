@@ -1,13 +1,15 @@
 # -*- coding: utf-8 -*-
-
 # TODO:
 #    * Move/rename namespace polluting attributes
 #    * Documentation
 #    * Make backends optional: Meta.backends = (path, modelinstance/model, view)
 import hashlib
+import logging
 from collections import OrderedDict
 
 from django.db import models
+from django.utils import six
+from django.utils.encoding import python_2_unicode_compatible
 from django.utils.translation import ugettext_lazy as _
 from django.utils.functional import curry
 from django.contrib.sites.models import Site
@@ -18,33 +20,37 @@ from django.core.cache import cache
 from django.utils.encoding import iri_to_uri
 from django.db.utils import DatabaseError
 
-from djangoseo.utils import NotSet, Literal
+from djangoseo.utils import NotSet, Literal, import_tracked_models
 from djangoseo.options import Options
 from djangoseo.fields import MetadataField, Tag, MetaTag, KeywordTag, Raw
 from djangoseo.backends import backend_registry, RESERVED_FIELD_NAMES
 
 
+logger = logging.getLogger(__name__)
+
+
 registry = OrderedDict()
 
 
+@python_2_unicode_compatible
 class FormattedMetadata(object):
     """ Allows convenient access to selected metadata.
         Metadata for each field may be sourced from any one of the relevant instances passed.
     """
 
-    def __init__(self, metadata, instances, path, site=None, language=None):
+    def __init__(self, metadata, instances, path, site=None, language=None, subdomain=None):
         self.__metadata = metadata
         if metadata._meta.use_cache:
             if metadata._meta.use_sites and site:
-                hexpath = hashlib.md5(iri_to_uri(site.domain+path)).hexdigest()
+                hexpath = hashlib.md5(iri_to_uri(site.domain + path).encode('utf-8')).hexdigest()
             else:
-                hexpath = hashlib.md5(iri_to_uri(path)).hexdigest()
+                hexpath = hashlib.md5(iri_to_uri(path).encode('utf-8')).hexdigest()
+            prefix_bits = ['djangoseo', self.__metadata.__class__.__name__, hexpath]
             if metadata._meta.use_i18n:
-                self.__cache_prefix = 'djangoseo.%s.%s.%s' % (
-                    self.__metadata.__class__.__name__, hexpath, language)
-            else:
-                self.__cache_prefix = 'djangoseo.%s.%s' % (
-                    self.__metadata.__class__.__name__, hexpath)
+                prefix_bits.append(language)
+            if metadata._meta.use_subdomains and subdomain is not None:
+                prefix_bits.append(subdomain)
+            self.__cache_prefix = '.'.join(prefix_bits)
         else:
             self.__cache_prefix = None
         self.__instances_original = instances
@@ -94,7 +100,7 @@ class FormattedMetadata(object):
         if name in self.__metadata._meta.groups:
             if value is not None:
                 return value or None
-            value = '\n'.join(unicode(BoundMetadataField(self.__metadata._meta.elements[f], self._resolve_value(f)))
+            value = '\n'.join(six.text_type(BoundMetadataField(self.__metadata._meta.elements[f], self._resolve_value(f)))
                               for f in self.__metadata._meta.groups[name]).strip()
 
         # Look for an element called "name"
@@ -113,7 +119,7 @@ class FormattedMetadata(object):
 
         return value or None
 
-    def __unicode__(self):
+    def __str__(self):
         """ String version of this object is the html output of head elements. """
         if self.__cache_prefix is not None:
             value = cache.get(self.__cache_prefix)
@@ -121,7 +127,7 @@ class FormattedMetadata(object):
             value = None
 
         if value is None:
-            value = mark_safe(u'\n'.join(unicode(getattr(self, f)) for f, e in
+            value = mark_safe('\n'.join(six.text_type(getattr(self, f)) for f, e in
                                          self.__metadata._meta.elements.items() if e.head))
             if self.__cache_prefix is not None:
                 cache.set(self.__cache_prefix, value or '')
@@ -129,8 +135,12 @@ class FormattedMetadata(object):
         return value
 
 
+@python_2_unicode_compatible
 class BoundMetadataField(object):
     """ An object to help provide templates with access to a "bound" metadata field. """
+
+    def __bool__(self):
+        return bool(self.value)
 
     def __init__(self, field, value):
         self.field = field
@@ -139,14 +149,11 @@ class BoundMetadataField(object):
         else:
             self.value = None
 
-    def __unicode__(self):
-        if self.value:
-            return mark_safe(self.field.render(self.value))
-        else:
-            return u""
+    def make_safe(self):
+        return mark_safe(self.field.render(self.value)) if self.value else ''
 
     def __str__(self):
-        return self.__unicode__().encode("ascii", "ignore")
+        return self.make_safe()
 
 
 class MetadataBase(type):
@@ -171,10 +178,10 @@ class MetadataBase(type):
         options = Options(Meta, help_text)
 
         # Collect and sort our elements
-        elements = [(key, attrs.pop(key)) for key, obj in attrs.items()
+        elements = [(key, attrs.pop(key)) for key, obj in list(attrs.items())
                     if isinstance(obj, MetadataField)]
-        elements.sort(lambda x, y: cmp(x[1].creation_counter,
-                      y[1].creation_counter))
+        elements.sort(key=lambda x: x[1].creation_counter)
+
         elements = OrderedDict(elements)
 
         # Validation:
@@ -217,12 +224,13 @@ class MetadataBase(type):
         return new_class
 
     # TODO: Move this function out of the way (subclasses will want to define their own attributes)
-    def _get_formatted_data(cls, path, context=None, site=None, language=None):
+    def _get_formatted_data(cls, path, context=None, site=None, language=None, subdomain=None):
         """ Return an object to conveniently access the appropriate values. """
-        return FormattedMetadata(cls(), cls._get_instances(path, context, site, language), path, site, language)
+        return FormattedMetadata(cls(), cls._get_instances(path, context, site, language, subdomain),
+                                 path, site, language, subdomain)
 
     # TODO: Move this function out of the way (subclasses will want to define their own attributes)
-    def _get_instances(cls, path, context=None, site=None, language=None):
+    def _get_instances(cls, path, context=None, site=None, language=None, subdomain=None):
         """ A sequence of instances to discover metadata.
             Each instance from each backend is looked up when possible/necessary.
             This is a generator to eliminate unnecessary queries.
@@ -230,14 +238,20 @@ class MetadataBase(type):
         backend_context = {'view_context': context}
 
         for model in cls._meta.models.values():
-            for instance in model.objects.get_instances(path, site, language, backend_context) or []:
+            for instance in model.objects.get_instances(
+                    path=path,
+                    site=site,
+                    language=language,
+                    subdomain=subdomain,
+                    context=backend_context) or []:
                 if hasattr(instance, '_process_context'):
                     instance._process_context(backend_context)
                 yield instance
 
 
+@six.add_metaclass(MetadataBase)
 class Metadata(object):
-    __metaclass__ = MetadataBase
+    pass
 
 
 def _get_metadata_model(name=None):
@@ -247,21 +261,21 @@ def _get_metadata_model(name=None):
             return registry[name]
         except KeyError:
             if len(registry) == 1:
-                valid_names = u'Try using the name "%s" or simply leaving it out altogether.' % registry.keys()[0]
+                valid_names = u'Try using the name "%s" or simply leaving it out altogether.' % list(registry.keys())[0]
             else:
-                valid_names = u"Valid names are " + u", ".join(u'"%s"' % k for k in registry.keys())
+                valid_names = u"Valid names are " + u", ".join(u'"%s"' % k for k in list(registry.keys()))
             raise Exception(u"Metadata definition with name \"%s\" does not exist.\n%s" % (name, valid_names))
     else:
         assert len(registry) == 1, "You must have exactly one Metadata class, if using get_metadata() without a 'name' parameter."
-        return registry.values()[0]
+        return list(registry.values())[0]
 
 
-def get_metadata(path, name=None, context=None, site=None, language=None):
+def get_metadata(path, name=None, context=None, site=None, language=None, subdomain=None):
     metadata = _get_metadata_model(name)
-    return metadata._get_formatted_data(path, context, site, language)
+    return metadata._get_formatted_data(path, context, site, language, subdomain)
 
 
-def get_linked_metadata(obj, name=None, context=None, site=None, language=None):
+def get_linked_metadata(obj, name=None, context=None, site=None, language=None, subdomain=None):
     """ Gets metadata linked from the given object. """
     # XXX Check that 'modelinstance' and 'model' metadata are installed in backends
     # I believe that get_model() would return None if not
@@ -282,7 +296,7 @@ def get_linked_metadata(obj, name=None, context=None, site=None, language=None):
         except ModelMetadata.DoesNotExist:
             model_md = ModelMetadata(_content_type=content_type)
         instances.append(model_md)
-    return FormattedMetadata(Metadata, instances, '', site, language)
+    return FormattedMetadata(Metadata, instances, '', site, language, subdomain)
 
 
 def create_metadata_instance(metadata_class, instance):
@@ -304,7 +318,8 @@ def create_metadata_instance(metadata_class, instance):
     # Look for an existing object with this path
     language = getattr(instance, '_language', None)
     site = getattr(instance, '_site', None)
-    for md in metadata_class.objects.get_instances(path, site, language):
+    subdomain = getattr(instance, '_subdomain', None)
+    for md in metadata_class.objects.get_instances(path, site, language, subdomain):
         # If another object has the same path, remove the path.
         # It's harsh, but we need a unique path and will assume the other
         # link is outdated.
@@ -348,6 +363,29 @@ def _update_callback(model_class, sender, instance, created, **kwargs):
     create_metadata_instance(model_class, instance)
 
 
+def _handle_redirects_callback(model_class, sender, instance, **kwargs):
+    """
+    Callback to be attached to a pre_save signal of tracked models and
+    create instances of redirects for changed URLs.
+    """
+    # avoid RuntimeError for apps without enabled redirects
+    from django.contrib.redirects.models import Redirect
+
+    if not instance.pk:
+        return
+    try:
+        after = instance.get_absolute_url()
+        before = sender.objects.filter(id=instance.id).first().get_absolute_url()
+        if before != after:
+            Redirect.objects.get_or_create(
+                old_path=before,
+                new_path=after,
+                site=Site.objects.get_current()
+            )
+    except Exception as e:
+        logger.exception('Failed to create new redirect')
+
+
 def _delete_callback(model_class, sender, instance,  **kwargs):
     content_type = ContentType.objects.get_for_model(instance)
     model_class.objects.filter(_content_type=content_type, _object_id=instance.pk).delete()
@@ -365,3 +403,9 @@ def register_signals():
                 # TODO Currently it's not needed to create metadata for new instance
                 models.signals.post_save.connect(update_callback, sender=model, weak=False)
                 models.signals.pre_delete.connect(delete_callback, sender=model, weak=False)
+
+    if getattr(settings, 'SEO_USE_REDIRECTS', False):
+        redirects_models = import_tracked_models()
+        for model in redirects_models:
+            redirects_callback = curry(_handle_redirects_callback, model_class=model_instance)
+            models.signals.pre_save.connect(redirects_callback, sender=model, weak=False)

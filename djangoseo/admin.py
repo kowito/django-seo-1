@@ -1,11 +1,10 @@
 # -*- coding: utf-8 -*-
-
 from django import forms
 from django.contrib import admin
 from django.contrib.contenttypes.forms import BaseGenericInlineFormSet
 from django.contrib.contenttypes.admin import GenericStackedInline
 from django.contrib.contenttypes.models import ContentType
-from django.utils.encoding import smart_unicode
+from django.utils.encoding import smart_str
 from django.forms.models import fields_for_model
 from django.utils.translation import ugettext_lazy as _
 from django.utils.text import capfirst
@@ -16,67 +15,80 @@ from djangoseo.systemviews import get_seo_views
 
 # TODO Use groups as fieldsets
 
-# Varients without sites support
 
-class PathMetadataAdmin(admin.ModelAdmin):
-    list_display = ('_path',)
-    search_fields = ('_path',)
-
-
-class ModelInstanceMetadataAdmin(admin.ModelAdmin):
-    list_display = ('_content_type', '_object_id', '_path')
-    search_fields = ('_path', '_content_type__name')
-
-
-class ModelMetadataAdmin(admin.ModelAdmin):
-    list_display = ('_content_type',)
-    search_fields = ('_content_type__name',)
-
-
-class ViewMetadataAdmin(admin.ModelAdmin):
-    list_display = ('_view', )
-    search_fields = ('_view',)
+def get_path_admin(use_site=False, use_subdomains=False):
+    list_display = ['_path']
+    search_fields = ['_path']
+    list_filter = []
+    if use_site:
+        list_display.append('_site')
+        list_filter.append('_site')
+    if use_subdomains:
+        list_display.append('_subdomain')
+    return type('PathMetadataAdmin', (admin.ModelAdmin, ), {
+        'list_display': tuple(list_display),
+        'list_filter': tuple(list_filter),
+        'search_fields': tuple(search_fields)
+    })
 
 
-# Varients with sites support
-
-class SitePathMetadataAdmin(admin.ModelAdmin):
-    list_display = ('_path', '_site')
-    list_filter = ('_site',)
-    search_fields = ('_path',)
-
-
-class SiteModelInstanceMetadataAdmin(admin.ModelAdmin):
-    list_display = ('_path', '_content_type', '_object_id', '_site')
-    list_filter = ('_site', '_content_type')
-    search_fields = ('_path', '_content_type__name')
-
-
-class SiteModelMetadataAdmin(admin.ModelAdmin):
-    list_display = ('_content_type', '_site')
-    list_filter = ('_site',)
-    search_fields = ('_content_type__name',)
+def get_model_instance_admin(use_site=False, use_subdomains=False):
+    list_display = ['_content_type', '_object_id', '_path']
+    search_fields = ['_path', '_content_type__name']
+    list_filter = []
+    if use_site:
+        list_display.append('_site')
+        list_filter.append('_site')
+    if use_subdomains:
+        list_display.append('_subdomain')
+    return type('ModelInstanceMetadataAdmin', (admin.ModelAdmin,), {
+        'list_display': tuple(list_display),
+        'list_filter': tuple(list_filter),
+        'search_fields': tuple(search_fields)
+    })
 
 
-class SiteViewMetadataAdmin(admin.ModelAdmin):
-    list_display = ('_view', '_site')
-    list_filter = ('_site',)
-    search_fields = ('_view',)
+def get_model_admin(use_site=False, use_subdomains=False):
+    list_display = ['_content_type']
+    search_fields = ['_content_type__name']
+    list_filter = []
+    if use_site:
+        list_display.append('_site')
+        list_filter.append('_site')
+    if use_subdomains:
+        list_display.append('_subdomain')
+    return type('ModelMetadataAdmin', (admin.ModelAdmin,), {
+        'list_display': tuple(list_display),
+        'list_filter': tuple(list_filter),
+        'search_fields': tuple(search_fields)
+    })
+
+
+def get_view_admin(use_site=False, use_subdomains=False):
+    list_display = ['_view']
+    search_fields = ['_view']
+    list_filter = []
+    if use_site:
+        list_display.append('_site')
+        list_filter.append('_site')
+    if use_subdomains:
+        list_display.append('_subdomain')
+    return type('ViewMetadataAdmin', (admin.ModelAdmin,), {
+        'list_display': tuple(list_display),
+        'list_filter': tuple(list_filter),
+        'search_fields': tuple(search_fields)
+    })
 
 
 def register_seo_admin(admin_site, metadata_class):
     """ Register the backends specified in Meta.backends with the admin """
+    use_sites = metadata_class._meta.use_sites
+    use_subdomains = metadata_class._meta.use_subdomains
 
-    if metadata_class._meta.use_sites:
-        path_admin = SitePathMetadataAdmin
-        model_instance_admin = SiteModelInstanceMetadataAdmin
-        model_admin = SiteModelMetadataAdmin
-        view_admin = SiteViewMetadataAdmin
-    else:
-        path_admin = PathMetadataAdmin
-        model_instance_admin = ModelInstanceMetadataAdmin
-        model_admin = ModelMetadataAdmin
-        view_admin = ViewMetadataAdmin
+    path_admin = get_path_admin(use_sites, use_subdomains)
+    model_instance_admin = get_model_instance_admin(use_sites, use_subdomains)
+    model_admin = get_model_admin(use_sites, use_subdomains)
+    view_admin = get_view_admin(use_sites, use_subdomains)
 
     def get_list_display():
         return tuple(name for name, obj in metadata_class._meta.elements.items()
@@ -160,13 +172,13 @@ def get_model_form(metadata_class):
 
     # Restrict content type choices to the models set in seo_models
     content_types = get_seo_content_types(metadata_class._meta.seo_models)
-    content_type_choices = [(x._get_pk_val(), smart_unicode(x)) for x in
+    content_type_choices = [(x._get_pk_val(), smart_str(x)) for x in
                             ContentType.objects.filter(id__in=content_types)]
 
     # Get a list of fields, with _content_type at the start
     important_fields = ['_content_type'] + core_choice_fields(metadata_class)
-    _fields = important_fields + fields_for_model(model_class,
-                                                  exclude=important_fields).keys()
+    _fields = important_fields + list(fields_for_model(model_class,
+                                                  exclude=important_fields).keys())
 
     class ModelMetadataForm(forms.ModelForm):
         _content_type = forms.ChoiceField(label=capfirst(_("model")),
@@ -194,8 +206,8 @@ def get_modelinstance_form(metadata_class):
 
     # Get a list of fields, with _content_type at the start
     important_fields = ['_content_type'] + ['_object_id'] + core_choice_fields(metadata_class)
-    _fields = important_fields + fields_for_model(model_class,
-                                                  exclude=important_fields).keys()
+    _fields = important_fields + list(fields_for_model(model_class,
+                                                  exclude=important_fields).keys())
 
     class ModelMetadataForm(forms.ModelForm):
         _content_type = forms.ModelChoiceField(
@@ -218,8 +230,8 @@ def get_path_form(metadata_class):
 
     # Get a list of fields, with _view at the start
     important_fields = ['_path'] + core_choice_fields(metadata_class)
-    _fields = important_fields + fields_for_model(model_class,
-                                                  exclude=important_fields).keys()
+    _fields = important_fields + list(fields_for_model(model_class,
+                                                  exclude=important_fields).keys())
 
     class ModelMetadataForm(forms.ModelForm):
         class Meta:
@@ -238,8 +250,8 @@ def get_view_form(metadata_class):
 
     # Get a list of fields, with _view at the start
     important_fields = ['_view'] + core_choice_fields(metadata_class)
-    _fields = important_fields + fields_for_model(model_class,
-                                                  exclude=important_fields).keys()
+    _fields = important_fields + list(fields_for_model(model_class,
+                                                  exclude=important_fields).keys())
 
     class ModelMetadataForm(forms.ModelForm):
         _view = forms.ChoiceField(label=capfirst(_("view")),

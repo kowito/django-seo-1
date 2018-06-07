@@ -1,4 +1,39 @@
 # -*- coding: utf-8 -*-
+from __future__ import unicode_literals
+import hashlib
+
+from django.utils import six
+from django.core.urlresolvers import reverse
+from django.test import TestCase, override_settings
+from django.http import Http404
+
+try:
+    from django.test import TransactionTestCase
+except ImportError:
+    TransactionTestCase = TestCase
+from django.test.client import FakePayload, RequestFactory
+from django.contrib.contenttypes.models import ContentType
+from django.contrib.sites.models import Site
+from django.contrib.redirects.models import Redirect
+from django.contrib.auth.models import User
+from django.conf import settings
+from django.db import models, IntegrityError, transaction
+from django.core.handlers.wsgi import WSGIRequest
+from django.template import Template, RequestContext, TemplateSyntaxError
+from django.core.cache import cache
+from django.utils.encoding import iri_to_uri
+from django.core.management import call_command
+from django.apps import apps
+from django.contrib import admin
+
+from djangoseo.utils import create_dynamic_model, register_model_in_admin, import_tracked_models
+from djangoseo.seo import get_metadata as seo_get_metadata
+from djangoseo.base import registry
+from djangoseo.models import RedirectPattern
+from djangoseo.middleware import RedirectsMiddleware
+from .views import product_detail
+from .models import Page, Product, NoPath, Tag, Category
+from .seo import Coverage, WithSites, WithI18n, WithBackends, WithSubdomains
 
 """ Test suite for SEO framework.
 
@@ -30,32 +65,6 @@
         - verbose_name(_plural): this is passed onto Django
 
 """
-import StringIO
-import hashlib
-
-from django.core.urlresolvers import reverse
-from django.test import TestCase
-try:
-    from django.test import TransactionTestCase
-except ImportError:
-    TransactionTestCase = TestCase
-from django.test.client import FakePayload
-from django.contrib.contenttypes.models import ContentType
-from django.contrib.sites.models import Site
-from django.contrib.redirects.models import Redirect
-from django.contrib.auth.models import User
-from django.conf import settings
-from django.db import IntegrityError, transaction, OperationalError
-from django.core.handlers.wsgi import WSGIRequest
-from django.template import Template, RequestContext, TemplateSyntaxError
-from django.core.cache import cache
-from django.utils.encoding import iri_to_uri
-from django.core.management import call_command
-
-from djangoseo.seo import get_metadata as seo_get_metadata
-from djangoseo.base import registry
-from userapp.models import Page, Product, Category, NoPath, Tag
-from userapp.seo import Coverage, WithSites, WithI18n, WithRedirect, WithRedirectSites, WithCache, WithCacheSites, WithCacheI18n, WithBackends
 
 
 def get_metadata(path):
@@ -71,26 +80,33 @@ class DataSelection(TestCase):
         self.product = Product.objects.create()
         self.product_content_type = ContentType.objects.get_for_model(Product)
         # NB if signals aren't working, the following will fail.
-        self.product_metadata = Coverage._meta.get_model('modelinstance').objects.get(_content_type=self.product_content_type, _object_id=self.product.id)
+        self.product_metadata = Coverage._meta.get_model('modelinstance').objects.get(
+            _content_type=self.product_content_type, _object_id=self.product.id)
         self.product_metadata.title = "ModelInstance title"
         self.product_metadata.keywords = "ModelInstance keywords"
         self.product_metadata.save()
 
         self.page = Page.objects.create(title=u"Page Title", type="abc")
         self.page_content_type = ContentType.objects.get_for_model(Page)
-        self.page_metadata = Coverage._meta.get_model('modelinstance').objects.get(_content_type=self.page_content_type, _object_id=self.page.id)
+        self.page_metadata = Coverage._meta.get_model('modelinstance').objects.get(_content_type=self.page_content_type,
+                                                                                   _object_id=self.page.id)
         self.page_metadata.title = "Page title"
         self.page_metadata.keywords = "Page keywords"
         self.page_metadata.save()
 
         # Model metadata
-        self.model_metadata = Coverage._meta.get_model('model').objects.create(_content_type=self.product_content_type, title="Model title", keywords="Model keywords")
+        self.model_metadata = Coverage._meta.get_model('model').objects.create(_content_type=self.product_content_type,
+                                                                               title="Model title",
+                                                                               keywords="Model keywords")
 
         # Path metadata
-        self.path_metadata = Coverage._meta.get_model('path').objects.create(_path="/path/", title="Path title", keywords="Path keywords")
+        self.path_metadata = Coverage._meta.get_model('path').objects.create(_path="/path/", title="Path title",
+                                                                             keywords="Path keywords")
 
         # View metadata
-        self.view_metadata = Coverage._meta.get_model('view').objects.create(_view="userapp_my_view", title="View title", keywords="View keywords")
+        self.view_metadata = Coverage._meta.get_model('view').objects.create(_view="userapp_my_view",
+                                                                             title="View title",
+                                                                             keywords="View keywords")
 
     def test_path(self):
         """ Checks that a direct path listing is always found first. """
@@ -111,11 +127,12 @@ class DataSelection(TestCase):
         old_count = Coverage._meta.get_model('modelinstance').objects.all().count()
         page.save()
         new_count = Coverage._meta.get_model('modelinstance').objects.all().count()
-        self.assertEqual(new_count, old_count+1)
+        self.assertEqual(new_count, old_count + 1)
 
         # Check that the correct data is loaded
-        assert 'New Page title' not in unicode(get_metadata(path).title)
-        Coverage._meta.get_model('modelinstance').objects.filter(_content_type=self.page_content_type, _object_id=page.id).update(title="New Page title")
+        assert 'New Page title' not in six.text_type(get_metadata(path).title)
+        Coverage._meta.get_model('modelinstance').objects.filter(_content_type=self.page_content_type,
+                                                                 _object_id=page.id).update(title="New Page title")
         self.assertEqual(get_metadata(path).title.value, 'New Page title')
 
     def test_model(self):
@@ -144,7 +161,8 @@ class DataSelection(TestCase):
         """
         path = "/abc/"
         site = Site.objects.get_current()
-        path_metadata = WithSites._meta.get_model('path').objects.create(_site=site, title="Site Path title", _path=path)
+        path_metadata = WithSites._meta.get_model('path').objects.create(_site=site, title="Site Path title",
+                                                                         _path=path)
         self.assertEqual(seo_get_metadata(path, name="WithSites").title.value, 'Site Path title')
         # Metadata with site=null should work
         path_metadata._site_id = None
@@ -160,57 +178,70 @@ class DataSelection(TestCase):
         """
         path = "/abc/"
         language = 'de'
-        path_metadata = WithI18n._meta.get_model('path').objects.create(_language='de', title="German Path title", _path=path)
+        path_metadata = WithI18n._meta.get_model('path').objects.create(_language='de', title="German Path title",
+                                                                        _path=path)
         self.assertEqual(seo_get_metadata(path, name="WithI18n", language="de").title.value, 'German Path title')
         # Metadata with an explicitly wrong site should not work
         path_metadata._language = "en"
         path_metadata.save()
         self.assertEqual(seo_get_metadata(path, name="WithI18n", language="de").title.value, None)
 
-#    # FUTURE feature
-#
-#    def test_redirect(self):
-#        """ Tests django.contrib.redirect support, automatically adding redirects for new paths.
-#        """
-#        old_path = "/abc/"
-#        new_path = "/new-path/"
-#
-#        # Check that the redirect doesn't already exist
-#        self.assertEqual(Redirect.objects.filter(old_path=old_path, new_path=new_path).count(), 0)
-#
-#        path_metadata = WithRedirect._meta.get_model('path').objects.create(title="A Path title", _path=old_path)
-#        self.assertEqual(seo_get_metadata(old_path, name="WithRedirect").title.value, 'A Path title')
-#
-#        # Rename the path
-#        path_metadata._path = new_path
-#        path_metadata.save()
-#        self.assertEqual(seo_get_metadata(old_path, name="WithRedirect").title.value, None)
-#        self.assertEqual(seo_get_metadata(new_path, name="WithRedirect").title.value, 'A Path title')
-#
-#        # Check that a redirect was created
-#        self.assertEqual(Redirect.objects.filter(old_path=old_path, new_path=new_path).count(), 1)
-#
-#    def test_redirect_with_sites(self):
-#        """ Tests django.contrib.redirect support, automatically adding redirects for new paths.
-#        """
-#        old_path = "/abc/"
-#        new_path = "/new-path/"
-#        site = Site.objects.get_current()
-#
-#        # Check that the redirect doesn't already exist
-#        self.assertEqual(Redirect.objects.filter(old_path=old_path, new_path=new_path, site=site).count(), 0)
-#
-#        path_metadata = WithRedirectSites._meta.get_model('path').objects.create(title="A Path title", _path=old_path, _site=site)
-#        self.assertEqual(seo_get_metadata(old_path, name="WithRedirectSites").title.value, 'A Path title')
-#
-#        # Rename the path
-#        path_metadata._path = new_path
-#        path_metadata.save()
-#        self.assertEqual(seo_get_metadata(old_path, name="WithRedirectSites").title.value, None)
-#        self.assertEqual(seo_get_metadata(new_path, name="WithRedirectSites").title.value, 'A Path title')
-#
-#        # Check that a redirect was created
-#        self.assertEqual(Redirect.objects.filter(old_path=old_path, new_path=new_path, site=site).count(), 1)
+    def test_subdomains(self):
+        path = '/abc/'
+        subdomain = 'msk'
+        path_metadata = WithSubdomains._meta.get_model('path').objects.create(
+            _subdomain='msk', title='German Path title', _path=path
+        )
+        self.assertEqual(
+            seo_get_metadata(path, name='WithSubdomains', subdomain=subdomain).title.value, 'German Path title')
+        path_metadata._subdomain = 'spb'
+        path_metadata.save()
+        self.assertEqual(seo_get_metadata(path, name='WithSubdomains', subdomain=subdomain).title.value, None)
+
+    #    # FUTURE feature
+    #
+    #    def test_redirect(self):
+    #        """ Tests django.contrib.redirect support, automatically adding redirects for new paths.
+    #        """
+    #        old_path = "/abc/"
+    #        new_path = "/new-path/"
+    #
+    #        # Check that the redirect doesn't already exist
+    #        self.assertEqual(Redirect.objects.filter(old_path=old_path, new_path=new_path).count(), 0)
+    #
+    #        path_metadata = WithRedirect._meta.get_model('path').objects.create(title="A Path title", _path=old_path)
+    #        self.assertEqual(seo_get_metadata(old_path, name="WithRedirect").title.value, 'A Path title')
+    #
+    #        # Rename the path
+    #        path_metadata._path = new_path
+    #        path_metadata.save()
+    #        self.assertEqual(seo_get_metadata(old_path, name="WithRedirect").title.value, None)
+    #        self.assertEqual(seo_get_metadata(new_path, name="WithRedirect").title.value, 'A Path title')
+    #
+    #        # Check that a redirect was created
+    #        self.assertEqual(Redirect.objects.filter(old_path=old_path, new_path=new_path).count(), 1)
+    #
+    #    def test_redirect_with_sites(self):
+    #        """ Tests django.contrib.redirect support, automatically adding redirects for new paths.
+    #        """
+    #        old_path = "/abc/"
+    #        new_path = "/new-path/"
+    #        site = Site.objects.get_current()
+    #
+    #        # Check that the redirect doesn't already exist
+    #        self.assertEqual(Redirect.objects.filter(old_path=old_path, new_path=new_path, site=site).count(), 0)
+    #
+    #        path_metadata = WithRedirectSites._meta.get_model('path').objects.create(title="A Path title", _path=old_path, _site=site)
+    #        self.assertEqual(seo_get_metadata(old_path, name="WithRedirectSites").title.value, 'A Path title')
+    #
+    #        # Rename the path
+    #        path_metadata._path = new_path
+    #        path_metadata.save()
+    #        self.assertEqual(seo_get_metadata(old_path, name="WithRedirectSites").title.value, None)
+    #        self.assertEqual(seo_get_metadata(new_path, name="WithRedirectSites").title.value, 'A Path title')
+    #
+    #        # Check that a redirect was created
+    #        self.assertEqual(Redirect.objects.filter(old_path=old_path, new_path=new_path, site=site).count(), 1)
 
     def test_missing_value(self):
         """ Checks that nothing breaks when no value could be found.
@@ -218,7 +249,7 @@ class DataSelection(TestCase):
         """
         path = "/abc/"
         self.assertEqual(seo_get_metadata(path, name="WithSites").title.value, None)
-        self.assertEqual(unicode(seo_get_metadata(path, name="WithSites").title), "")
+        self.assertEqual(six.text_type(seo_get_metadata(path, name="WithSites").title), "")
 
     def test_path_conflict(self):
         """ Check the crazy scenario where an existing metadata object has the same path. """
@@ -229,7 +260,8 @@ class DataSelection(TestCase):
 
         # Create a new product that will take the same path
         new_product = Product.objects.create()
-        Coverage._meta.get_model('modelinstance').objects.filter(_content_type=self.product_content_type, _object_id=new_product.id).update(title="New Title")
+        Coverage._meta.get_model('modelinstance').objects.filter(_content_type=self.product_content_type,
+                                                                 _object_id=new_product.id).update(title="New Title")
 
         # This test will not work if we have the id wrong
         if new_product.id != 2:
@@ -249,7 +281,7 @@ class DataSelection(TestCase):
         """
         from django.core.urlresolvers import NoReverseMatch
         try:
-            self.page.type = "a type with spaces!" # this causes get_absolute_url() to fail
+            self.page.type = "a type with spaces!"  # this causes get_absolute_url() to fail
             self.page.save()
             self.fail("No exception raised on developer error.")
         except NoReverseMatch:
@@ -261,12 +293,14 @@ class DataSelection(TestCase):
             self.page_metadata.delete()
             self.page.title = "A New Page Title"
             self.page.save()
-            Coverage._meta.get_model('modelinstance').objects.get(_content_type=self.page_content_type, _object_id=self.page.id).delete()
+            Coverage._meta.get_model('modelinstance').objects.get(_content_type=self.page_content_type,
+                                                                  _object_id=self.page.id).delete()
             self.page.type = "a-new-type"
             self.page.save()
-            Coverage._meta.get_model('modelinstance').objects.get(_content_type=self.page_content_type, _object_id=self.page.id).delete()
+            Coverage._meta.get_model('modelinstance').objects.get(_content_type=self.page_content_type,
+                                                                  _object_id=self.page.id).delete()
             self.page.delete()
-        except Exception, e:
+        except Exception as e:
             self.fail("Exception raised inappropriately: %r" % e)
 
     def test_path_change(self):
@@ -274,7 +308,8 @@ class DataSelection(TestCase):
         self.page.type = "new-type"
         self.page.save()
         metadata_1 = Coverage._meta.get_model('modelinstance').objects.get(_path=self.page.get_absolute_url())
-        metadata_2 = Coverage._meta.get_model('modelinstance').objects.get(_content_type=self.page_content_type, _object_id=self.page.id)
+        metadata_2 = Coverage._meta.get_model('modelinstance').objects.get(_content_type=self.page_content_type,
+                                                                           _object_id=self.page.id)
         self.assertEqual(metadata_1.id, metadata_2.id)
 
         self.assertEqual(get_metadata(path=self.page.get_absolute_url()).title.value, 'Page title')
@@ -318,12 +353,14 @@ class DataSelection(TestCase):
 class ValueResolution(TestCase):
     """ Value resolution (unit tests).
     """
+
     def setUp(self):
         InstanceMetadata = Coverage._meta.get_model('modelinstance')
         ModelMetadata = Coverage._meta.get_model('model')
         ViewMetadata = Coverage._meta.get_model('view')
 
-        self.page1 = Page.objects.create(title=u"MD Page One Title", type=u"page-one-type", content=u"Page one content.")
+        self.page1 = Page.objects.create(title=u"MD Page One Title", type=u"page-one-type",
+                                         content=u"Page one content.")
         self.page2 = Page.objects.create(type=u"page-two-type", content=u"Page two content.")
 
         self.page_content_type = ContentType.objects.get_for_model(Page)
@@ -343,9 +380,9 @@ class ValueResolution(TestCase):
         self.context2 = get_metadata(path=self.page2.get_absolute_url())
 
         self.view_metadata = ViewMetadata.objects.create(_view="userapp_my_view")
-        self.view_metadata.title = "MD {{ text }} Title"
-        self.view_metadata.keywords = "MD {{ text }} Keywords"
-        self.view_metadata.description = "MD {{ text }} Description"
+        self.view_metadata.title = u"MD {{ text }} Title"
+        self.view_metadata.keywords = u"MD {{ text }} Keywords"
+        self.view_metadata.description = u"MD {{ text }} Description"
         self.view_metadata.save()
 
     def test_direct_data(self):
@@ -367,7 +404,7 @@ class ValueResolution(TestCase):
 
     def test_populate_from_field(self):
         # Data direct from another field
-        self.assertEqual(self.context1.populate_from6.value, u'MD Keywords')
+        self.assertEqual(self.context1.populate_from6.value, 'MD Keywords')
         # Data direct from another field's populate_from
         self.assertEqual(self.context1.populate_from2.value, None)
 
@@ -375,10 +412,12 @@ class ValueResolution(TestCase):
         path = self.page1.get_absolute_url()
         # Collect instances from all four metadata model for the same path
         # Each will have a title (ie field with populate_from) and a heading (ie field without populate_from)
-        path_md = Coverage._meta.get_model('path').objects.create(_path=path, title='path title', heading="path heading")
+        path_md = Coverage._meta.get_model('path').objects.create(_path=path, title='path title',
+                                                                  heading="path heading")
         modelinstance_md = self.metadata1
         model_md = self.model_metadata
-        view_md = Coverage._meta.get_model('view').objects.create(_view='userapp_page_detail', title='view title', heading="view heading")
+        view_md = Coverage._meta.get_model('view').objects.create(_view='userapp_page_detail', title='view title',
+                                                                  heading="view heading")
         # Correct some values
         modelinstance_md.title = "model instance title"
         modelinstance_md.heading = "model instance heading"
@@ -435,16 +474,16 @@ class ValueResolution(TestCase):
 
     def test_model_variable_substitution(self):
         """ Simple check to see if model variable substitution is happening """
-        self.assertEqual(self.context2.keywords.value, u'MMD Keywords, page-two-type, more keywords')
-        self.assertEqual(self.context1.description.value, u'MMD Description for MD Page One Title and MD Page One Title')
-        self.assertEqual(self.context2.description.value, u'MMD Description for Page two content. and Page two content.')
+        self.assertEqual(self.context2.keywords.value, 'MMD Keywords, page-two-type, more keywords')
+        self.assertEqual(self.context1.description.value, 'MMD Description for MD Page One Title and MD Page One Title')
+        self.assertEqual(self.context2.description.value, 'MMD Description for Page two content. and Page two content.')
 
     def test_view_variable_substitution(self):
         """ Simple check to see if view variable substitution is happening """
         response = self.client.get(reverse('userapp_my_view', args=["abc123"]))
-        self.assertContains(response, u'<title>MD abc123 Title</title>')
-        self.assertContains(response, u'<meta name="keywords" content="MD abc123 Keywords" />')
-        self.assertContains(response, u'<meta name="hs:metatag" content="MD abc123 Description" />')
+        self.assertContains(response, '<title>MD abc123 Title</title>')
+        self.assertContains(response, '<meta name="keywords" content="MD abc123 Keywords" />')
+        self.assertContains(response, '<meta name="hs:metatag" content="MD abc123 Description" />')
 
     def test_not_request_context(self):
         """ Tests the view metadata on a view that is not a request context. """
@@ -460,17 +499,18 @@ class ValueResolution(TestCase):
 class Formatting(TestCase):
     """ Formatting (unit tests)
     """
+
     def setUp(self):
         self.path_metadata = Coverage._meta.get_model('path')(
-                _path        = "/",
-                title       = "The <strong>Title</strong>",
-                heading     = "The <em>Heading</em>",
-                keywords    = 'Some, keywords", with\n other, chars\'',
-                description = "A \n description with \" interesting\' chars.",
-                raw1        = '<meta name="author" content="seo" /><hr /> '
-                              'No text outside tags please.',
-                raw2        = '<meta name="author" content="seo" />'
-                              '<script>make_chaos();</script>')
+            _path="/",
+            title="The <strong>Title</strong>",
+            heading="The <em>Heading</em>",
+            keywords='Some, keywords", with\n other, chars\'',
+            description="A \n description with \" interesting\' chars.",
+            raw1='<meta name="author" content="seo" /><hr /> '
+                 'No text outside tags please.',
+            raw2='<meta name="author" content="seo" />'
+                 '<script>make_chaos();</script>')
         self.path_metadata.save()
 
         self.metadata = get_metadata(path="/")
@@ -484,28 +524,29 @@ class Formatting(TestCase):
 <meta name="hs:metatag" content="A   description with &quot; interesting&#39; chars." />
 <meta name="author" content="seo" />
 <meta name="author" content="seo" />"""
-        assert unicode(self.metadata).strip() == exp.strip(), "Incorrect html:\n" + unicode(self.metadata) + "\n\n" + unicode(exp)
+        assert six.text_type(self.metadata).strip() == exp.strip(), "Incorrect html:\n" + six.text_type(
+            self.metadata) + "\n\n" + six.text_type(exp)
 
     def test_description(self):
         """ Tests the tag2 is cleaned correctly. """
         exp = "A   description with &quot; interesting&#39; chars."
         self.assertEqual(self.metadata.description.value, exp)
         exp = '<meta name="hs:metatag" content="%s" />' % exp
-        self.assertEqual(unicode(self.metadata.description), exp)
+        self.assertEqual(six.text_type(self.metadata.description), exp)
 
     def test_keywords(self):
         """ Tests keywords are cleaned correctly. """
         exp = "Some, keywords&quot;, with,  other, chars&#39;"
         self.assertEqual(self.metadata.keywords.value, exp)
         exp = '<meta name="keywords" content="%s" />' % exp
-        self.assertEqual(unicode(self.metadata.keywords), exp)
+        self.assertEqual(six.text_type(self.metadata.keywords), exp)
 
     def test_inline_tags(self):
         """ Tests the title is cleaned correctly. """
         exp = 'The <strong>Title</strong>'
         self.assertEqual(self.metadata.title.value, exp)
         exp = '<title>%s</title>' % exp
-        self.assertEqual(unicode(self.metadata.title), exp)
+        self.assertEqual(six.text_type(self.metadata.title), exp)
 
     def test_inline_tags2(self):
         """ Tests the title is cleaned correctly. """
@@ -515,7 +556,7 @@ class Formatting(TestCase):
         exp = 'The <strong id=\"mytitle\">Title</strong>'
         self.assertEqual(metadata.title.value, exp)
         exp = '<title>%s</title>' % exp
-        self.assertEqual(unicode(metadata.title), exp)
+        self.assertEqual(six.text_type(metadata.title), exp)
 
     def test_inline_tags3(self):
         """ Tests the title is cleaned correctly. """
@@ -525,7 +566,7 @@ class Formatting(TestCase):
         exp = 'The < strong >Title</ strong >'
         self.assertEqual(metadata.title.value, exp)
         exp = '<title>%s</title>' % exp
-        self.assertEqual(unicode(metadata.title), exp)
+        self.assertEqual(six.text_type(metadata.title), exp)
 
     def test_inline_tags4(self):
         """ Tests the title is cleaned correctly. """
@@ -535,7 +576,7 @@ class Formatting(TestCase):
         exp = 'The <strong class="with&quot;inside">Title</strong>'
         self.assertEqual(metadata.title.value, exp)
         exp = '<title>%s</title>' % exp
-        self.assertEqual(unicode(metadata.title), exp)
+        self.assertEqual(six.text_type(metadata.title), exp)
 
     def test_inline_tags5(self):
         """ Tests the title is cleaned correctly. """
@@ -545,7 +586,7 @@ class Formatting(TestCase):
         exp = 'The Title <!-- with a comment -->'
         self.assertEqual(metadata.title.value, exp)
         exp = '<title>%s</title>' % exp
-        self.assertEqual(unicode(metadata.title), exp)
+        self.assertEqual(six.text_type(metadata.title), exp)
 
     def test_forbidden_tags(self):
         """ Tests the title is cleaned correctly. """
@@ -555,21 +596,21 @@ class Formatting(TestCase):
         exp = 'The &lt;div&gt;Title&lt;/div&gt;'
         self.assertEqual(metadata.title.value, exp)
         exp = '<title>%s</title>' % exp
-        self.assertEqual(unicode(metadata.title), exp)
+        self.assertEqual(six.text_type(metadata.title), exp)
 
     def test_raw1(self):
         """ Tests that raw fields in head are cleaned correctly.
         """
         exp = '<meta name="author" content="seo" />'
         self.assertEqual(self.metadata.raw1.value, exp)
-        self.assertEqual(unicode(self.metadata.raw1), exp)
+        self.assertEqual(six.text_type(self.metadata.raw1), exp)
 
     def test_raw2(self):
         """ Tests that raw fields in head are cleaned correctly.
         """
         exp = '<meta name="author" content="seo" />'
         self.assertEqual(self.metadata.raw2.value, exp)
-        self.assertEqual(unicode(self.metadata.raw2), exp)
+        self.assertEqual(six.text_type(self.metadata.raw2), exp)
 
     def test_raw3(self):
         """ Checks that raw fields aren't cleaned too enthusiastically  """
@@ -580,10 +621,10 @@ class Formatting(TestCase):
 
         exp = '<title>Raw title 1</title>'
         self.assertEqual(metadata.raw1.value, exp)
-        self.assertEqual(unicode(metadata.raw1), exp)
+        self.assertEqual(six.text_type(metadata.raw1), exp)
         exp = '<title>Raw title 2</title>'
         self.assertEqual(metadata.raw2.value, exp)
-        self.assertEqual(unicode(metadata.raw2), exp)
+        self.assertEqual(six.text_type(metadata.raw2), exp)
 
 
 class Definition(TransactionTestCase):
@@ -597,8 +638,8 @@ class Definition(TransactionTestCase):
     """
 
     def test_backends(self):
-        self.assertEqual(Coverage._meta.models.keys(), ['path', 'modelinstance', 'model', 'view'])
-        self.assertEqual(WithBackends._meta.models.keys(), ['view', 'path'])
+        self.assertEqual(list(Coverage._meta.models.keys()), ['path', 'modelinstance', 'model', 'view'])
+        self.assertEqual(list(WithBackends._meta.models.keys()), ['view', 'path'])
 
     def test_help_text_direct(self):
         self.assert_help_text('help_text1', "Some help text 1.")
@@ -634,12 +675,20 @@ class Definition(TransactionTestCase):
 
         # Check that uniqueness handles sites correctly
         current_site = Site.objects.get_current()
-        another_site = Site.objects.create(id=current_site.id+1)
+        another_site = Site.objects.create(id=current_site.id + 1)
         WithSites._meta.get_model('path').objects.create(_site=current_site, _path="/unique/")
         pmd = WithSites._meta.get_model('path').objects.create(_site=another_site, _path="/unique/")
         try:
             WithSites._meta.get_model('path').objects.create(_site=current_site, _path="/unique/")
             self.fail("Exception not raised when duplicate path/site combination created")
+        except IntegrityError:
+            transaction.rollback()
+
+        WithSubdomains._meta.get_model('path').objects.create(_subdomain='msk', title='Main page', _path='/')
+        WithSubdomains._meta.get_model('path').objects.create(_subdomain='spb', title='Main page', _path='/')
+        try:
+            WithSubdomains._meta.get_model('path').objects.create(_subdomain='msk', title='Main page', _path='/')
+            self.fail('Exception not raised when duplicate path/subdomain combination created')
         except IntegrityError:
             transaction.rollback()
 
@@ -665,8 +714,8 @@ class MetaOptions(TestCase):
             path = '/'
             hexpath = hashlib.md5(iri_to_uri(path)).hexdigest()
 
-            #unicode(seo_get_metadata(path, name="Coverage"))
-            unicode(seo_get_metadata(path, name="WithCache"))
+            # six.text_type(seo_get_metadata(path, name="Coverage"))
+            six.text_type(seo_get_metadata(path, name="WithCache"))
 
             self.assertEqual(cache.get('djangoseo.Coverage.%s.title' % hexpath), None)
             self.assertEqual(cache.get('djangoseo.WithCache.%s.title' % hexpath), "1234")
@@ -678,10 +727,10 @@ class MetaOptions(TestCase):
         if 'dummy' not in settings.CACHE_BACKEND:
             path = '/'
             site = Site.objects.get_current()
-            hexpath = hashlib.md5(iri_to_uri(site.domain+path)).hexdigest()
+            hexpath = hashlib.md5(iri_to_uri(site.domain + path)).hexdigest()
 
-            #unicode(seo_get_metadata(path, name="Coverage"))
-            unicode(seo_get_metadata(path, name="WithCacheSites", site=site))
+            # six.text_type(seo_get_metadata(path, name="Coverage"))
+            six.text_type(seo_get_metadata(path, name="WithCacheSites", site=site))
 
             self.assertEqual(cache.get('djangoseo.Coverage.%s.title' % hexpath), None)
             self.assertEqual(cache.get('djangoseo.WithCacheSites.%s.title' % hexpath), "1234")
@@ -694,13 +743,51 @@ class MetaOptions(TestCase):
             path = '/'
             hexpath = hashlib.md5(iri_to_uri(path)).hexdigest()
 
-            #unicode(seo_get_metadata(path, name="Coverage"))
-            unicode(seo_get_metadata(path, name="WithCacheI18n", language='de'))
+            # six.text_type(seo_get_metadata(path, name="Coverage"))
+            six.text_type(seo_get_metadata(path, name="WithCacheI18n", language='de'))
 
             self.assertEqual(cache.get('djangoseo.Coverage.%s.de.title' % hexpath), None)
             self.assertEqual(cache.get('djangoseo.WithCacheI18n.%s.en.title' % hexpath), None)
             self.assertEqual(cache.get('djangoseo.WithCacheI18n.%s.de.title' % hexpath), "1234")
             self.assertEqual(cache.get('djangoseo.WithCacheI18n.%s.de.subtitle' % hexpath), "")
+
+    def test_use_cache_i18n_subdomain(self):
+        """ Checks that the cache plays nicely with i18n and subdomain.
+        """
+        if 'dummy' not in settings.CACHE_BACKEND:
+            path = '/'
+            hexpath = hashlib.md5(iri_to_uri(path)).hexdigest()
+
+            six.text_type(seo_get_metadata(path, name='WithSubdomains', language='ru', subdomain='msk'))
+
+            self.assertEqual(cache.get('djangoseo.Coverage.%s.de.msk.title' % hexpath), None)
+            self.assertEqual(cache.get('djangoseo.WithSubdomains.%s.en.msk.title' % hexpath), None)
+            self.assertEqual(cache.get('djangoseo.WithSubdomains.%s.ru.spb.title' % hexpath), None)
+            self.assertEqual(cache.get('djangoseo.WithSubdomains.%s.ru.spb.subtitle' % hexpath), None)
+            self.assertEqual(cache.get('djangoseo.WithSubdomains.%s.ru.msk.title' % hexpath), '1234')
+            self.assertEqual(cache.get('djangoseo.WithSubdomains.%s.ru.msk.subtitle' % hexpath), '')
+
+    def test_use_cache_i18n_with_empty_subdomain(self):
+        """
+        Checks that the cache plays nicely with i18n and subdomain, but sudomain is None.
+        """
+        if 'dummy' not in settings.CACHE_BACKEND:
+            path = '/'
+            hexpath = hashlib.md5(iri_to_uri(path)).hexdigest()
+
+            six.text_type(seo_get_metadata(path, name='WithSubdomains', language='ru', subdomain=None))
+
+            self.assertEqual(cache.get('djangoseo.Coverage.%s.de.title' % hexpath), None)
+            self.assertEqual(cache.get('djangoseo.WithCacheI18n.%s.en.title' % hexpath), None)
+            self.assertEqual(cache.get('djangoseo.WithSubdomains.%s.ru.title' % hexpath), '1234')
+            self.assertEqual(cache.get('djangoseo.WithSubdomains.%s.ru.subtitle' % hexpath), '')
+
+            six.text_type(seo_get_metadata(path, name='WithSubdomains', language='ru', subdomain=''))
+
+            self.assertEqual(cache.get('djangoseo.Coverage.%s.de..title' % hexpath), None)
+            self.assertEqual(cache.get('djangoseo.WithCacheI18n.%s.en..title' % hexpath), None)
+            self.assertEqual(cache.get('djangoseo.WithSubdomains.%s.ru..title' % hexpath), '1234')
+            self.assertEqual(cache.get('djangoseo.WithSubdomains.%s.ru..subtitle' % hexpath), '')
 
 
 class Templates(TestCase):
@@ -709,16 +796,18 @@ class Templates(TestCase):
         To write:
         - {% get_metadata ClassName on site in language for path as var %} All at once!
     """
+
     def setUp(self):
         self.path = "/abc/"
-        Coverage._meta.get_model('path').objects.create(_path=self.path, title="A Title", description="A Description", raw1="Some raw text")
+        Coverage._meta.get_model('path').objects.create(_path=self.path, title="A Title", description="A Description",
+                                                        raw1="Some raw text")
         self.metadata = get_metadata(path=self.path)
         self.context = {}
 
     def test_basic(self):
         self.deregister_alternatives()
-        self.compilesTo("{% get_metadata %}", unicode(self.metadata))
-        self.compilesTo("{% get_metadata as var %}{{ var }}", unicode(self.metadata))
+        self.compilesTo("{% get_metadata %}", six.text_type(self.metadata))
+        self.compilesTo("{% get_metadata as var %}{{ var }}", six.text_type(self.metadata))
 
     def test_for_path(self):
         self.deregister_alternatives()
@@ -729,8 +818,8 @@ class Templates(TestCase):
         self.compilesTo("{%% get_metadata for \"%s\" %%}" % other_path, "<title>example.com</title>")
         self.compilesTo("{%% get_metadata for \"%s\" as var %%}{{ var }}" % other_path, "<title>example.com</title>")
 
-        self.compilesTo("{%% get_metadata for \"%s\" %%}" % path, unicode(self.metadata))
-        self.compilesTo("{%% get_metadata for \"%s\" as var %%}{{ var }}" % path, unicode(self.metadata))
+        self.compilesTo("{%% get_metadata for \"%s\" %%}" % path, six.text_type(self.metadata))
+        self.compilesTo("{%% get_metadata for \"%s\" as var %%}{{ var }}" % path, six.text_type(self.metadata))
 
     def test_for_obj(self):
         self.deregister_alternatives()
@@ -742,8 +831,21 @@ class Templates(TestCase):
         self.compilesTo("{% get_metadata for obj as var %}{{ var }}", "<title>example.com</title>")
 
         self.context = {'obj': {'get_absolute_url': lambda: path}}
-        self.compilesTo("{% get_metadata for obj %}", unicode(self.metadata))
-        self.compilesTo("{% get_metadata for obj as var %}{{ var }}", unicode(self.metadata))
+        self.compilesTo("{% get_metadata for obj %}", six.text_type(self.metadata))
+        self.compilesTo("{% get_metadata for obj as var %}{{ var }}", six.text_type(self.metadata))
+
+    def test_for_subdomain(self):
+        self.deregister_alternatives()
+        path = self.path
+        self.path = "/another-path/"
+        # Where the path does not find a metadata object, defaults should be returned
+        self.context = {'obj': {'get_absolute_url': lambda: "/a-third-path/"}}
+        self.compilesTo("{% get_metadata for obj %}", "<title>example.com</title>")
+        self.compilesTo("{% get_metadata for obj as var %}{{ var }}", "<title>example.com</title>")
+
+        self.context = {'obj': {'get_absolute_url': lambda: path}}
+        self.compilesTo("{% get_metadata for obj %}", six.text_type(self.metadata))
+        self.compilesTo("{% get_metadata for obj as var %}{{ var }}", six.text_type(self.metadata))
 
     def test_for_obj_no_metadata(self):
         """ Checks that defaults are used when no metadata object (previously) exists.
@@ -755,9 +857,10 @@ class Templates(TestCase):
         Metadata = Coverage._meta.get_model('modelinstance')
 
         # Create a page with metadata (with a path that get_metadata won't find)
-        page = Page.objects.create(title=u"Page Title", type="nometadata", content="no meta data")
+        page = Page.objects.create(title=u"Page Title", type=u"nometadata", content=u"no meta data")
         content_type = ContentType.objects.get_for_model(Page)
-        Metadata.objects.filter(_content_type=content_type, _object_id=page.pk).update(title="Page Title", _path="/different/")
+        Metadata.objects.filter(_content_type=content_type, _object_id=page.pk).update(title="Page Title",
+                                                                                       _path="/different/")
 
         expected_output = '<title>Page Title</title>'
 
@@ -766,14 +869,14 @@ class Templates(TestCase):
         self.compilesTo("{% get_metadata for obj %}", expected_output)
         self.compilesTo("{% get_metadata for obj as var %}{{ var }}", expected_output)
         self.compilesTo("{% get_metadata for obj as var %}{{ var.populate_from7 }}",
-                '<populate_from7>model instance content: no meta data</populate_from7>')
+                        '<populate_from7>model instance content: no meta data</populate_from7>')
 
         # Check the output is correct when there is no metadata
         Metadata.objects.filter(_content_type=content_type, _object_id=page.pk).delete()
         self.compilesTo("{% get_metadata for obj %}", "<title>example.com</title>")
         self.compilesTo("{% get_metadata for obj as var %}{{ var }}", "<title>example.com</title>")
         self.compilesTo("{% get_metadata for obj as var %}{{ var.populate_from7 }}",
-                '<populate_from7>model instance content: no meta data</populate_from7>')
+                        '<populate_from7>model instance content: no meta data</populate_from7>')
 
     def test_for_obj_no_path(self):
         InstanceMetadata = Coverage._meta.get_model('modelinstance')
@@ -783,7 +886,8 @@ class Templates(TestCase):
         obj1 = NoPath.objects.create()
         obj2 = NoPath.objects.create()
         content_type = ContentType.objects.get_for_model(NoPath)
-        obj_metadata = InstanceMetadata.objects.create(_content_type=content_type, _object_id=obj2.id, title="Correct Title")
+        obj_metadata = InstanceMetadata.objects.create(_content_type=content_type, _object_id=obj2.id,
+                                                       title="Correct Title")
 
         self.context = {'obj': obj2}
         expected_metadata = '<title>Correct Title</title>'
@@ -805,7 +909,8 @@ class Templates(TestCase):
         except TemplateSyntaxError:
             pass
         try:
-            self.compilesTo("{% get_metadata ThisDoesNotExist as var %}{{ var }}", "This should have raised an exception")
+            self.compilesTo("{% get_metadata ThisDoesNotExist as var %}{{ var }}",
+                            "This should have raised an exception")
         except TemplateSyntaxError:
             pass
 
@@ -823,23 +928,23 @@ class Templates(TestCase):
             pass
 
     def test_class_name(self):
-        self.compilesTo("{% get_metadata Coverage %}", unicode(self.metadata))
-        self.compilesTo("{% get_metadata Coverage as var %}{{ var }}", unicode(self.metadata))
+        self.compilesTo("{% get_metadata Coverage %}", six.text_type(self.metadata))
+        self.compilesTo("{% get_metadata Coverage as var %}{{ var }}", six.text_type(self.metadata))
         path = self.path
         self.context = {'obj': {'get_absolute_url': lambda: path}}
         self.path = "/another-path/"
-        self.compilesTo("{%% get_metadata Coverage for \"%s\" %%}" % path, unicode(self.metadata))
-        self.compilesTo("{%% get_metadata Coverage for \"%s\" as var %%}{{ var }}"% path, unicode(self.metadata))
-        self.compilesTo("{% get_metadata Coverage for obj %}", unicode(self.metadata))
-        self.compilesTo("{% get_metadata Coverage for obj as var %}{{ var }}", unicode(self.metadata))
+        self.compilesTo("{%% get_metadata Coverage for \"%s\" %%}" % path, six.text_type(self.metadata))
+        self.compilesTo("{%% get_metadata Coverage for \"%s\" as var %%}{{ var }}" % path, six.text_type(self.metadata))
+        self.compilesTo("{% get_metadata Coverage for obj %}", six.text_type(self.metadata))
+        self.compilesTo("{% get_metadata Coverage for obj as var %}{{ var }}", six.text_type(self.metadata))
 
     def test_variable_group(self):
         self.deregister_alternatives()
-        self.compilesTo("{% get_metadata as var %}{{ var.advanced }}", unicode(self.metadata.raw1))
+        self.compilesTo("{% get_metadata as var %}{{ var.advanced }}", six.text_type(self.metadata.raw1))
 
     def test_variable_field(self):
         self.deregister_alternatives()
-        self.compilesTo("{% get_metadata as var %}{{ var.raw1 }}", unicode(self.metadata.raw1))
+        self.compilesTo("{% get_metadata as var %}{{ var.raw1 }}", six.text_type(self.metadata.raw1))
 
     def test_variable_field_value(self):
         self.deregister_alternatives()
@@ -852,15 +957,26 @@ class Templates(TestCase):
     def test_language(self):
         WithI18n._meta.get_model('path').objects.create(_path=self.path, title="A Title", _language="de")
         metadata = seo_get_metadata(path=self.path, name="WithSites", language="de")
-        self.compilesTo('{% get_metadata WithI18n in "de" %}', unicode(metadata))
+        self.compilesTo('{% get_metadata WithI18n in "de" %}', six.text_type(metadata))
         self.compilesTo('{% get_metadata WithI18n in "en" %}', "")
 
     def test_site(self):
         new_site = Site.objects.create(domain="new-example.com", name="New example")
         WithSites._meta.get_model('path').objects.create(_path=self.path, title="A Title", _site=new_site)
         metadata = seo_get_metadata(path=self.path, name="WithSites", site=new_site)
-        self.compilesTo('{% get_metadata WithI18n on "new-example.com" %}', unicode(metadata))
+        self.compilesTo('{% get_metadata WithI18n on "new-example.com" %}', six.text_type(metadata))
         self.compilesTo('{% get_metadata WithI18n in "example.com" %}', "")
+
+    def test_subdomain(self):
+        msk = 'msk'
+        WithSubdomains._meta.get_model('path').objects.create(_path=self.path, title='All', _subdomain='',
+                                                              _all_subdomains=True)
+        metadata = seo_get_metadata(path=self.path, name='WithSubdomains')
+        self.compilesTo('{% get_metadata WithSubdomains %}', six.text_type(metadata))
+        WithSubdomains._meta.get_model('path').objects.create(_path=self.path, title='A Title', _subdomain=msk)
+        metadata = seo_get_metadata(path=self.path, name='WithSubdomains', subdomain=msk)
+        self.compilesTo('{% get_metadata WithSubdomains under "msk" %}', six.text_type(metadata))
+        self.compilesTo('{% get_metadata WithSubdomains on "msk" %}', '')
 
     def compilesTo(self, input, expected_output):
         """ Asserts that the given template string compiles to the given output.
@@ -882,8 +998,8 @@ class Templates(TestCase):
         """ Deregister any alternative metadata classes for the sake of testing.
             This emulates the situation where there is only one metadata definition.
         """
-        self._previous_registry = registry.items()
-        for key in registry.keys():
+        self._previous_registry = list(registry.items())
+        for key in list(registry.keys()):
             del registry[key]
         registry['Coverage'] = Coverage
 
@@ -924,7 +1040,7 @@ class Random(TestCase):
         num_metadata = self.Metadata.objects.all().count()
         try:
             no_path = NoPath.objects.create()
-        except Exception, e:
+        except Exception as e:
             self.fail("Exception inappropriately raised: %r" % e)
         new_num_metadata = self.Metadata.objects.all().count()
         self.assertEqual(num_metadata, new_num_metadata)
@@ -965,7 +1081,7 @@ class Admin(TestCase):
         path = '/admin/userapp/page/add/'
         try:
             response = self.client.get(path)
-        except Exception, e:
+        except Exception as e:
             self.fail(u"Exception raised at '%s': %s" % (path, e))
         self.assertEqual(response.status_code, 200)
 
@@ -984,8 +1100,8 @@ class Admin(TestCase):
 
         try:
             response = self.client.post(path, data, follow=True)
-        except Exception, e:
-            self.fail(u"Exception raised at '%s': %s" % (path, e))
+        except Exception as e:
+            self.fail("Exception raised at '%s': %s" % (path, e))
         self.assertEqual(response.status_code, 200)
 
         path = '/admin/djangoseo/coveragemodel/add/'
@@ -996,7 +1112,7 @@ class Admin(TestCase):
 
         try:
             response = self.client.post(path, data, follow=True)
-        except Exception, e:
+        except Exception as e:
             self.fail(u"Exception raised at '%s': %s" % (path, e))
         self.assertEqual(response.status_code, 200)
 
@@ -1026,8 +1142,153 @@ class Admin(TestCase):
             path = '/alt-admin/userapp/%s/add/' % model
             try:
                 response = self.client.get(path)
-            except Exception, e:
-                self.fail(u"Exception raised at '%s': %s" % (path, e))
+            except Exception as e:
+                self.fail("Exception raised at '%s': %s" % (path, e))
             self.assertContains(response, "seo-coveragemodelinstance-_content_type", status_code=200)
             self.assertNotContains(response, "seo-withsitesmodelinstance-_content_type")
             self.assertContains(response, "seo-withseomodelsmodelinstance-_content_type", status_code=200)
+
+
+class CreateDynamicModelTest(TestCase):
+    model_name = 'Dog'
+    attrs = {
+        'name': models.CharField(max_length=100),
+        'breed': models.CharField(max_length=250),
+        'age': models.IntegerField()
+    }
+
+    def setUp(self):
+        self.model = create_dynamic_model(self.model_name, **self.attrs)
+
+    def test_instance(self):
+        self.assertTrue(issubclass(self.model, models.Model))
+
+    def test_model_name(self):
+        self.assertNotEquals(self.model._meta.model_name.lower(), self.model_name)
+
+    def test_model_fields(self):
+        received_fields = self.model._meta.get_all_field_names()
+        expected_fields = ['id'] + list(self.attrs.keys())
+        self.assertSetEqual(set(received_fields), set(expected_fields))
+
+    def test_field_instances(self):
+        self.assertIsInstance(self.model._meta.get_field('name'), models.CharField)
+        self.assertIsInstance(self.model._meta.get_field('breed'), models.CharField)
+        self.assertIsInstance(self.model._meta.get_field('age'), models.IntegerField)
+
+    def test_magic_attributes(self):
+        self.assertTrue(hasattr(self.model, '__module__'))
+        self.assertTrue(hasattr(self.model, '__dynamic__'))
+
+    def test_module_name(self):
+        self.assertEqual(self.model.__module__, 'djangoseo.models')
+
+    def tearDown(self):
+        del apps.all_models['djangoseo']['dog']
+
+
+class RegisterModelInAdminTest(TestCase):
+    model_name = 'Animal'
+    attrs = {
+        'name': models.CharField(max_length=250),
+    }
+
+    def setUp(self):
+        self.model = create_dynamic_model(self.model_name, **self.attrs)
+        register_model_in_admin(self.model)
+
+    def test(self):
+        self.assertIn(self.model, admin.site._registry)
+
+    def tearDown(self):
+        del apps.all_models['djangoseo']['animal']
+
+
+class ImportTrackedModels(TestCase):
+
+    @override_settings(SEO_REDIRECTS_MODELS=('userapp.models.Page', 'models.Product', 'Category'))
+    def test_import(self):
+        tracked_models = import_tracked_models()
+        self.assertIn(Page, tracked_models)
+        self.assertNotIn(Product, tracked_models)
+        self.assertNotIn(Category, tracked_models)
+
+
+class RedirectsMiddlewareTest(TestCase):
+
+    def test_create_redirect(self):
+        middleware = RedirectsMiddleware()
+        request_factory = RequestFactory()
+        current_site = Site.objects.get_current()
+        product_id = '123'
+        product_path = reverse('userapp_product_detail', args=(product_id,))
+
+        response = self.client.get(product_path)
+        self.assertEqual(response.status_code, 404)
+
+        redirect_path = reverse('userapp_page_detail', args=('product',))
+        redirect_pattern1 = RedirectPattern.objects.create(
+            url_pattern='/products/(\d+)/',
+            redirect_path=redirect_path,
+            site=current_site
+        )
+        redirect_pattern2 = RedirectPattern.objects.create(
+            url_pattern='/products/(\d+)/',
+            redirect_path=redirect_path,
+            site=current_site,
+            all_subdomains=True,
+        )
+
+        # main scenario
+        response = self.client.get(product_path)
+        self.assertEqual(response.status_code, 301)
+        self.assertEqual(Redirect.objects.count(), 1)
+        redirect = Redirect.objects.first()
+        self.assertEqual(redirect.old_path, product_path)
+        self.assertEqual(redirect.new_path, redirect_path)
+
+        # with subdomain
+        redirect.delete()
+        redirect_pattern1.subdomain = 'msk'
+        redirect_pattern1.save()
+        request = request_factory.get(product_path)
+        request.subdomain = 'msk'
+        try:
+            product_detail(request, product_id)
+        except Http404 as e:
+            middleware.process_exception(request, e)
+        self.assertEqual(Redirect.objects.count(), 1)
+
+        # all subdomain flag
+        Redirect.objects.first().delete()
+        response = self.client.get(product_path)
+        self.assertEqual(response.status_code, 301)
+        self.assertEqual(Redirect.objects.count(), 1)
+        redirect_pattern2.delete()
+        Redirect.objects.first().delete()
+
+        # with another site
+        another_site = Site.objects.create(
+            domain='example.net',
+            name='example.net'
+        )
+        redirect_pattern1.site = another_site
+        redirect_pattern1.save()
+        response = self.client.get(product_path)
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(Redirect.objects.count(), 0)
+
+
+class RedirectsFromModelsTest(TestCase):
+
+    def setUp(self):
+        self.page = Page.objects.create(title='Page Title', type='asd')
+
+    def test_redirects_models(self):
+        self.page.type = 'dsa'
+        self.page.save()
+        redirect = Redirect.objects.first()
+        self.assertTrue(redirect)
+        self.assertTrue(redirect.old_path == reverse('userapp_page_detail', args=['asd']))
+        self.assertTrue(redirect.new_path == reverse('userapp_page_detail', args=['dsa']))
+        self.assertTrue(redirect.site == Site.objects.get_current())

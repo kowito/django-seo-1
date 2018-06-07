@@ -1,3 +1,4 @@
+from __future__ import unicode_literals
 """
 Django settings for tests project.
 """
@@ -37,6 +38,8 @@ MIDDLEWARE_CLASSES = (
     #'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
+    'django.contrib.redirects.middleware.RedirectFallbackMiddleware',
+    'djangoseo.middleware.RedirectsMiddleware'
 )
 
 TEMPLATE_DIRS = (
@@ -97,6 +100,9 @@ CACHE_BACKEND = 'dummy://'
 SEO_MODELS = ('userapp',)
 
 TEST_RUNNER = 'django.test.runner.DiscoverRunner'
+
+SEO_USE_REDIRECTS = True
+SEO_TRACKED_MODELS = ('userapp.models.Page',)
 
 try:
     from settings_local import *
